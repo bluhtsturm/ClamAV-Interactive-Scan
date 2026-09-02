@@ -9,8 +9,8 @@ Ein interaktives Bash-Frontend für ClamAV mit Live-Fortschrittsbalken, parallel
 
 | Datei / File      | Sprache / Language          |
 | ----------------- | --------------------------- |
-| `antivirus.sh`    | Deutsche Oberfläche         |
-| `antivirus-en.sh` | English user interface      |
+| `antivirus_de.sh`    | Deutsche Oberfläche         |
+| `antivirus_en.sh` | English user interface      |
 
 Beide Dateien sind funktional identisch — nur Texte und Kommentare unterscheiden sich.
 *Both files are functionally identical — only texts and comments differ.*
@@ -87,7 +87,7 @@ und beim Dienststart mit berücksichtigt.
 ```bash
 git clone https://github.com/bluhtsturm/clamav-interactive-scan.git
 cd clamav-interactive-scan
-chmod +x antivirus.sh antivirus-en.sh
+chmod +x antivirus_de.sh antivirus_en.sh
 ```
 
 ClamAV selbst kann das Skript beim ersten Start installieren; manuell etwa so:
@@ -102,14 +102,14 @@ sudo zypper install clamav                  # openSUSE
 Optional systemweit verfügbar machen:
 
 ```bash
-sudo install -m 755 antivirus.sh /usr/local/bin/antivirus
+sudo install -m 755 antivirus_de.sh /usr/local/bin/antivirus
 ```
 
 ### Benutzung
 
 ```bash
-./antivirus.sh          # Benutzerkontext: liest nur, was der eigene Account darf
-sudo ./antivirus.sh     # empfohlen für den Systemscan (/)
+./antivirus_de.sh          # Benutzerkontext: liest nur, was der eigene Account darf
+sudo ./antivirus_de.sh     # empfohlen für den Systemscan (/)
 ```
 
 Das Skript führt durch folgende Fragen:
@@ -339,7 +339,7 @@ and service startup.
 ```bash
 git clone https://github.com/bluhtsturm/clamav-interactive-scan.git
 cd clamav-interactive-scan
-chmod +x antivirus.sh antivirus-en.sh
+chmod +x antivirus_de.sh antivirus_en.sh
 ```
 
 The script can install ClamAV on first start; manually it is:
@@ -354,14 +354,14 @@ sudo zypper install clamav                  # openSUSE
 Optionally make it available system-wide:
 
 ```bash
-sudo install -m 755 antivirus-en.sh /usr/local/bin/antivirus
+sudo install -m 755 antivirus_en.sh /usr/local/bin/antivirus
 ```
 
 ### Usage
 
 ```bash
-./antivirus-en.sh        # user context: reads only what your account may read
-sudo ./antivirus-en.sh   # recommended for a system scan (/)
+./antivirus_en.sh        # user context: reads only what your account may read
+sudo ./antivirus_en.sh   # recommended for a system scan (/)
 ```
 
 The script walks you through these questions:
