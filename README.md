@@ -2,6 +2,7 @@
 
 Ein interaktives Bash-Frontend für ClamAV mit Live-Fortschrittsbalken, parallelem
 `clamdscan` und Hänger-Erkennung.
+
 *An interactive Bash front-end for ClamAV with a live progress bar, parallel
 `clamdscan` and stall detection.*
 
@@ -13,6 +14,7 @@ Ein interaktives Bash-Frontend für ClamAV mit Live-Fortschrittsbalken, parallel
 | `antivirus_en.sh` | English user interface      |
 
 Beide Dateien sind funktional identisch — nur Texte und Kommentare unterscheiden sich.
+
 *Both files are functionally identical — only texts and comments differ.*
 
 ---
