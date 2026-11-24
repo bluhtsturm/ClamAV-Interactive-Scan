@@ -1,5 +1,7 @@
 # ClamAV Interactive Scan
 
+[![ShellCheck](https://github.com/bluhtsturm/ClamAV-Interactive-Scan/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/bluhtsturm/ClamAV-Interactive-Scan/actions/workflows/shellcheck.yml)
+
 Ein interaktives Bash-Frontend für ClamAV mit Live-Fortschrittsbalken, parallelem
 `clamdscan` und Hänger-Erkennung.
 
@@ -17,6 +19,8 @@ Beide Dateien sind funktional identisch — nur Texte und Kommentare unterscheid
 
 *Both files are functionally identical — only texts and comments differ.*
 
+Änderungen je Version / changes per version: [CHANGELOG.md](CHANGELOG.md)
+
 ---
 
 <a id="deutsch"></a>
@@ -32,17 +36,22 @@ schneller, kann aber weder Verzeichnisse ausschließen noch parallel arbeiten.
 
 Dieses Skript legt eine Bedienoberfläche darüber:
 
-* **Live-Fortschrittsbalken** mit Prozent, Dateizähler, Trefferzahl und Laufzeit —
-  gespeist aus der laufenden ClamAV-Ausgabe, ohne zweiten Verzeichnisdurchlauf.
+* **Live-Fortschrittsbalken** mit Prozent, Dateizähler, Trefferzahl, Laufzeit und
+  geschätzter Restzeit — gespeist aus der laufenden ClamAV-Ausgabe, ohne zweiten
+  Verzeichnisdurchlauf. Der Balken passt sich der Breite des Terminals an.
 * **Paralleler `clamdscan`-Modus**: Die Dateiliste wird in Pakete zerlegt, die von
   mehreren unabhängigen `clamdscan`-Prozessen gleichzeitig abgearbeitet werden.
 * **Hänger-Erkennung**: Ein Paket, das seit `STALL_TIMEOUT` Sekunden keine einzige
   neue Ergebniszeile schreibt, wird gezielt beendet — und das Skript sagt genau,
   **bei welcher Datei** es stehengeblieben ist.
 * **Explizite Dateiliste** statt rohem Pfad: Pseudo-Dateisysteme (`/proc`, `/sys`,
-  `/dev`, `/run`, `/snap`) und eigene Ausschlüsse werden sicher übersprungen.
-* **Automatische Vorbereitung**: Signatur-Update, Start von `clamd`, Erkennung der
-  Distribution und optionale Installation von ClamAV.
+  `/dev`, `/run`, `/snap`), Snapshots und eigene Ausschlüsse werden sicher
+  übersprungen; nicht lesbare Dateien werden gezählt statt verschwiegen.
+* **Btrfs-tauglich**: Subvolumes desselben Dateisystems (z. B. `/home`, `/var`
+  unter Fedora und openSUSE) werden automatisch mitgescannt.
+* **Automatische Vorbereitung**: Signatur-Update, Start von `clamd` (Dienstnamen
+  von Debian, Fedora, Arch und openSUSE), Erkennung der Distribution und
+  optionale Installation von ClamAV — über `sudo` oder `doas`.
 * **Sauberer Abbruch**: Strg+C beendet die komplette Prozesshierarchie und räumt
   temporäre Dateien auf.
 
@@ -50,7 +59,7 @@ Dieses Skript legt eine Bedienoberfläche darüber:
 
 ```
 ====================================
-   ClamAV — interaktiver Scan v1.2.0
+   ClamAV — interaktiver Scan v1.3.0
 ====================================
 1) Internes System scannen (/)
 2) Externes Laufwerk scannen
@@ -65,7 +74,7 @@ Zu scannen: 612483 Dateien
 
 Scan läuft — Abbruch mit Strg+C.
 /home/user/Downloads/test.exe: Win.Test.EICAR_HDB-1 FOUND
-[##############################----------]  74% (453901/612483) — 1 Fund(e) — 41:07
+[#################------]  74% (453901/612483) — 1 Fund(e) — 41:07, noch ~14:12
 ```
 
 ### Voraussetzungen
@@ -74,12 +83,12 @@ Scan läuft — Abbruch mit Strg+C.
 | ------------------ | ------------------------------------------------------------- |
 | **Bash ≥ 4.4**     | wegen assoziativer Arrays, `wait -n` und `mapfile -d`          |
 | **ClamAV**         | `clamscan` und/oder `clamdscan` (+ `clamav-daemon` empfohlen)  |
-| **coreutils**      | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stty`, `wc` |
-| **findutils**      | GNU `find` (`-readable`, `-xdev`, `-print0`)                   |
+| **coreutils**      | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stat`, `stty`, `wc` |
+| **findutils**      | GNU `find` (`-readable`, `-xdev`, `-fprint`)                   |
 | **procps**         | `pkill` — ohne das Paket funktioniert der Abbruch weniger sauber |
-| **util-linux**     | `script` (optional, erzwingt zeilenweise Ausgabe von ClamAV)   |
-| **systemd**        | optional, für Start/Stopp von `clamav-daemon` und `freshclam`  |
-| **sudo**           | optional; als root läuft das Skript auch ohne                  |
+| **util-linux**     | `script` (optional, erzwingt zeilenweise Ausgabe von ClamAV), `findmnt` (optional, für Btrfs-Subvolumes) |
+| **systemd**        | optional, für Start/Stopp von `clamd` und `freshclam`          |
+| **sudo** / **doas**| optional; als root läuft das Skript auch ohne                  |
 
 Getestet unter Debian/Ubuntu; Fedora, Arch und openSUSE werden bei der Installation
 und beim Dienststart mit berücksichtigt.
@@ -111,15 +120,16 @@ sudo install -m 755 antivirus_de.sh /usr/local/bin/antivirus
 
 ```bash
 ./antivirus_de.sh          # Benutzerkontext: liest nur, was der eigene Account darf
-sudo ./antivirus_de.sh     # empfohlen für den Systemscan (/)
+sudo ./antivirus_de.sh     # empfohlen für den Systemscan (/), alternativ doas
 ```
 
 Das Skript führt durch folgende Fragen:
 
 1. **Was soll gescannt werden?** System (`/`), externes Laufwerk (aus
    `/media/$USER` bzw. `/run/media/$USER`) oder ein beliebiger Pfad.
-2. **Signaturen aktualisieren?** Stoppt bei Bedarf `clamav-freshclam`, ruft
-   `freshclam` auf und startet den Dienst danach wieder.
+2. **Signaturen aktualisieren?** Stoppt bei Bedarf den freshclam-Dienst
+   (`clamav-freshclam` bzw. `freshclam`), ruft `freshclam` auf und startet den
+   Dienst danach wieder.
 3. **Umgang mit Funden:** nur melden (Standard), in Quarantäne verschieben oder
    löschen. Löschen muss durch Eintippen von `LOESCHEN` (englische Fassung:
    `DELETE`) bestätigt werden.
@@ -128,9 +138,11 @@ Das Skript führt durch folgende Fragen:
    zurückgefallen.
 5. **Parallele Verbindungen** (nur `clamdscan`): Vorgabe ist `nproc`.
 6. **Auch eingehängte Dateisysteme?** Ohne diese Option bleibt der Scan per
-   `-xdev` auf dem Dateisystem des Startpfads — ein separat eingehängtes `/home`
-   wird dann **nicht** mitgescannt. Das gilt auch für Btrfs-Subvolumes (Standard
-   bei Fedora und openSUSE), siehe [Fehlerbehebung](#fehlerbehebung).
+   `-xdev` auf dem Dateisystem des Startpfads — eine separate `/home`-Partition
+   oder ein USB-Stick wird dann **nicht** mitgescannt. Eingehängte Btrfs-Subvolumes
+   **desselben** Dateisystems (Standard bei Fedora und openSUSE: `/home`, `/var`,
+   `/opt` …) werden dagegen automatisch mitgenommen und vor dem Scan aufgelistet;
+   Snapshots bleiben draußen.
 
 Abbruch jederzeit mit **Strg+C**: Worker werden beendet, Temporärdateien gelöscht,
 das bisherige Protokoll bleibt erhalten.
@@ -178,8 +190,13 @@ Am Kopf des Skripts:
 | `CHUNK_SIZE`      | `2000`   | Dateien pro Paket. Kleiner = feinerer Fortschritt, mehr Prozessstarts |
 | `STALL_TIMEOUT`   | `900`    | Sekunden ohne neue Ergebniszeile, ab denen ein Paket als hängend gilt |
 | `BATCH_TIMEOUT`   | `28800`  | absolute Obergrenze pro Paket (Notnagel, sollte nie greifen)        |
-| `EXCLUDE_PATHS`   | leer     | zusätzliche Pfade, die immer übersprungen werden                    |
+| `EXCLUDE_PATHS`   | leer     | zusätzliche Pfade, die übersprungen werden*                         |
+| `SNAPSHOT_PATHS`  | `/.snapshots` | Snapshot-Bäume (snapper), werden übersprungen*                 |
 | `PSEUDO_PATHS`    | `/proc /sys /dev /run /snap` | Pseudo-Dateisysteme, nie scannen                |
+
+\* Beginnt ein Scan **innerhalb** eines solchen Pfads (oder in der Quarantäne),
+wird er trotzdem gescannt — die ausdrückliche Wahl hat Vorrang. Für
+`PSEUDO_PATHS` gilt das nicht.
 
 Beispiel für Wine-/Proton-/Steam-Installationen, die aus zehntausenden winzigen
 Dateien bestehen und einen Systemscan enorm ausbremsen:
@@ -196,9 +213,10 @@ EXCLUDE_PATHS=(
 ### Ergebnisse
 
 * **Protokoll:** `~/clamav_scan_JJJJMMTT_HHMMSS.log` — Kopfzeilen mit Pfad,
-  Scanner, Flags und Dateizahl, danach alle Funde und Lesefehler sowie eine
+  Umfang (inkl. Btrfs-Subvolumes), Scanner, Flags, Dateizahl und übersprungenen
+  Dateien, danach alle Funde und Lesefehler sowie eine
   Zusammenfassung. Wird nach dem Lauf dem aufrufenden Benutzer übereignet, auch
-  wenn das Skript unter `sudo` lief.
+  wenn das Skript unter `sudo` oder `doas` lief.
 * **Quarantäne:** `~/clamav_quarantine`, Rechte `700`. Der Ordner wird bei
   späteren Scans automatisch übersprungen.
 * **Abgebrochene Pakete:** `~/clamav_abbruch_part_XXXX_HHMMSS.list` — die
@@ -251,11 +269,16 @@ Erwartetes Verhalten, wenn Pakete abgebrochen wurden: deren restliche Dateien
 werden nie gezählt. Die Zusammenfassung zeigt „geprüft X von Y“.
 
 **Ein separates `/home` wird nicht gescannt**
-`-xdev` ist Standard. Beim Umfang die Frage nach eingehängten Dateisystemen mit
-`j` beantworten. Auf Btrfs (Standard bei Fedora und openSUSE) zählt jedes
-Subvolume als eigenes Dateisystem — dort fehlen ohne `j` z. B. `/home`, `/var`
-oder `/opt`. Unter openSUSE dann `/.snapshots` in `EXCLUDE_PATHS` aufnehmen,
-sonst wird jeder Snapper-Snapshot erneut gescannt.
+`-xdev` ist Standard. Liegt `/home` auf einer eigenen Partition, beim Umfang die
+Frage nach eingehängten Dateisystemen mit `j` beantworten. Btrfs-Subvolumes
+desselben Dateisystems werden ohnehin automatisch mitgescannt (das Skript nennt
+sie vor dem Scan; dafür wird `findmnt` gebraucht). Snapshots unter
+`/.snapshots` bleiben auch mit `j` draußen, siehe `SNAPSHOT_PATHS`.
+
+**Die Restzeit springt**
+Sie wird aus dem bisherigen Durchschnittstempo hochgerechnet und erst nach 10 s
+mit Ergebnissen angezeigt. Große Dateien oder Archive gegen Ende verlängern den
+Scan über die Schätzung hinaus.
 
 ### Sicherheitshinweise
 
@@ -274,7 +297,9 @@ sonst wird jeder Snapper-Snapshot erneut gescannt.
 * Kein Echtzeitschutz — das Skript ist ein On-Demand-Scanner.
 * `clamdscan` nutzt die Limits aus `clamd.conf`; die Optionen `--max-filesize`
   und `--max-scansize` gelten nur im `clamscan`-Modus.
-* Die Restlaufzeit wird nicht geschätzt, nur die bisherige Laufzeit angezeigt.
+* Die Restzeit ist eine Hochrechnung aus dem bisherigen Tempo, keine Garantie.
+* Nur eingehängte Btrfs-Subvolumes werden automatisch mitgescannt; ZFS-Datasets
+  oder bcachefs-Subvolumes zählen weiterhin als eigene Dateisysteme.
 
 ### Lizenz
 
@@ -295,17 +320,22 @@ directories nor work in parallel.
 
 This script puts a usable front-end on top:
 
-* **Live progress bar** with percentage, file counter, hit count and elapsed
-  time — fed from ClamAV's running output, without a second directory traversal.
+* **Live progress bar** with percentage, file counter, hit count, elapsed time
+  and estimated time remaining — fed from ClamAV's running output, without a
+  second directory traversal. The bar adapts to the terminal width.
 * **Parallel `clamdscan` mode**: the file list is split into chunks that several
   independent `clamdscan` processes work through at the same time.
 * **Stall detection**: a chunk that has not written a single new result line for
   `STALL_TIMEOUT` seconds is terminated on purpose — and the script reports
   **exactly which file** it got stuck on.
 * **Explicit file list** instead of a raw path: pseudo filesystems (`/proc`,
-  `/sys`, `/dev`, `/run`, `/snap`) and your own exclusions are safely skipped.
-* **Automatic preparation**: signature update, starting `clamd`, distribution
-  detection and optional ClamAV installation.
+  `/sys`, `/dev`, `/run`, `/snap`), snapshots and your own exclusions are safely
+  skipped; unreadable files are counted instead of silently dropped.
+* **Btrfs-aware**: subvolumes of the same filesystem (e.g. `/home`, `/var` on
+  Fedora and openSUSE) are included automatically.
+* **Automatic preparation**: signature update, starting `clamd` (service names of
+  Debian, Fedora, Arch and openSUSE), distribution detection and optional ClamAV
+  installation — via `sudo` or `doas`.
 * **Clean abort**: Ctrl+C terminates the whole process hierarchy and removes
   temporary files.
 
@@ -313,7 +343,7 @@ This script puts a usable front-end on top:
 
 ```
 ====================================
-   ClamAV — interactive scan v1.2.0
+   ClamAV — interactive scan v1.3.0
 ====================================
 1) Scan the internal system (/)
 2) Scan an external drive
@@ -328,7 +358,7 @@ To be scanned: 612483 files
 
 Scan running — press Ctrl+C to abort.
 /home/user/Downloads/test.exe: Win.Test.EICAR_HDB-1 FOUND
-[##############################----------]  74% (453901/612483) — 1 hit(s) — 41:07
+[#################-------]  74% (453901/612483) — 1 hit(s) — 41:07, ~14:12 left
 ```
 
 ### Requirements
@@ -337,12 +367,12 @@ Scan running — press Ctrl+C to abort.
 | ---------------- | ------------------------------------------------------------- |
 | **Bash ≥ 4.4**   | for associative arrays, `wait -n` and `mapfile -d`             |
 | **ClamAV**       | `clamscan` and/or `clamdscan` (+ `clamav-daemon` recommended)  |
-| **coreutils**    | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stty`, `wc` |
-| **findutils**    | GNU `find` (`-readable`, `-xdev`, `-print0`)                   |
+| **coreutils**    | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stat`, `stty`, `wc` |
+| **findutils**    | GNU `find` (`-readable`, `-xdev`, `-fprint`)                   |
 | **procps**       | `pkill` — without it aborting is less clean                    |
-| **util-linux**   | `script` (optional, forces line-buffered ClamAV output)        |
-| **systemd**      | optional, to start/stop `clamav-daemon` and `freshclam`        |
-| **sudo**         | optional; as root the script works without it                  |
+| **util-linux**   | `script` (optional, forces line-buffered ClamAV output), `findmnt` (optional, for Btrfs subvolumes) |
+| **systemd**      | optional, to start/stop `clamd` and `freshclam`                |
+| **sudo** / **doas** | optional; as root the script works without it               |
 
 Tested on Debian/Ubuntu; Fedora, Arch and openSUSE are handled for installation
 and service startup.
@@ -374,15 +404,16 @@ sudo install -m 755 antivirus_en.sh /usr/local/bin/antivirus
 
 ```bash
 ./antivirus_en.sh        # user context: reads only what your account may read
-sudo ./antivirus_en.sh   # recommended for a system scan (/)
+sudo ./antivirus_en.sh   # recommended for a system scan (/), doas works too
 ```
 
 The script walks you through these questions:
 
 1. **What to scan?** System (`/`), an external drive (from `/media/$USER` or
    `/run/media/$USER`) or an arbitrary path.
-2. **Update signatures?** Stops `clamav-freshclam` if needed, runs `freshclam`
-   and starts the service again afterwards.
+2. **Update signatures?** Stops the freshclam service if needed
+   (`clamav-freshclam` or `freshclam`), runs `freshclam` and starts the service
+   again afterwards.
 3. **What to do with detections:** report only (default), move to quarantine or
    delete. Deleting must be confirmed by typing `DELETE` (German version:
    `LOESCHEN`).
@@ -390,9 +421,10 @@ The script walks you through these questions:
    answers. If that fails it falls back to `clamscan` automatically.
 5. **Parallel connections** (`clamdscan` only): defaults to `nproc`.
 6. **Also scan mounted filesystems?** Without this the scan stays on the
-   filesystem of the starting path via `-xdev` — a separately mounted `/home`
-   is then **not** included. The same applies to Btrfs subvolumes (the default
-   on Fedora and openSUSE), see [Troubleshooting](#troubleshooting).
+   filesystem of the starting path via `-xdev` — a separate `/home` partition or
+   a USB stick is then **not** included. Mounted Btrfs subvolumes of the **same**
+   filesystem (the default on Fedora and openSUSE: `/home`, `/var`, `/opt` …)
+   are included automatically and listed before the scan; snapshots stay out.
 
 Abort any time with **Ctrl+C**: workers are terminated, temporary files removed,
 and the log written so far is kept.
@@ -440,8 +472,12 @@ At the top of the script:
 | `CHUNK_SIZE`    | `2000`   | files per chunk. Smaller = finer progress, more process starts  |
 | `STALL_TIMEOUT` | `900`    | seconds without a new result line before a chunk counts as stuck |
 | `BATCH_TIMEOUT` | `28800`  | absolute limit per chunk (last resort, should never trigger)    |
-| `EXCLUDE_PATHS` | empty    | additional paths that are always skipped                        |
+| `EXCLUDE_PATHS` | empty    | additional paths that are skipped*                              |
+| `SNAPSHOT_PATHS`| `/.snapshots` | snapshot trees (snapper), skipped*                         |
 | `PSEUDO_PATHS`  | `/proc /sys /dev /run /snap` | pseudo filesystems, never scanned           |
+
+\* A scan that starts **inside** such a path (or inside the quarantine) still
+scans it — the explicit choice wins. This does not apply to `PSEUDO_PATHS`.
 
 Example for Wine/Proton/Steam installations, which consist of tens of thousands
 of tiny files and slow a system scan down enormously:
@@ -457,10 +493,10 @@ EXCLUDE_PATHS=(
 
 ### Results
 
-* **Log:** `~/clamav_scan_YYYYMMDD_HHMMSS.log` — header with path, scanner,
-  flags and file count, then every detection and read error plus a summary.
-  Ownership is handed to the calling user after the run, even when the script
-  ran under `sudo`.
+* **Log:** `~/clamav_scan_YYYYMMDD_HHMMSS.log` — header with path, scope
+  (including Btrfs subvolumes), scanner, flags, file count and skipped files,
+  then every detection and read error plus a summary. Ownership is handed to the
+  calling user after the run, even when the script ran under `sudo` or `doas`.
 * **Quarantine:** `~/clamav_quarantine`, mode `700`. Later scans skip this
   folder automatically.
 * **Aborted chunks:** `~/clamav_aborted_part_XXXX_HHMMSS.list` — the complete
@@ -513,11 +549,16 @@ Expected when chunks were aborted: their remaining files are never counted. The
 summary shows "scanned X of Y".
 
 **A separate `/home` is not scanned**
-`-xdev` is the default. Answer the scope question about mounted filesystems with
-`y`. On Btrfs (the default on Fedora and openSUSE) every subvolume counts as a
-filesystem of its own — without `y`, e.g. `/home`, `/var` or `/opt` are left
-out there. On openSUSE, add `/.snapshots` to `EXCLUDE_PATHS` in that case, or
-every Snapper snapshot gets scanned again.
+`-xdev` is the default. If `/home` is a partition of its own, answer the scope
+question about mounted filesystems with `y`. Btrfs subvolumes of the same
+filesystem are included automatically anyway (the script lists them before the
+scan; this needs `findmnt`). Snapshots under `/.snapshots` stay out even with
+`y`, see `SNAPSHOT_PATHS`.
+
+**The remaining time jumps around**
+It is extrapolated from the average speed so far and only shown after 10 s of
+results. Large files or archives near the end make the scan take longer than
+estimated.
 
 ### Safety notes
 
@@ -536,7 +577,9 @@ every Snapper snapshot gets scanned again.
 * No real-time protection — this is an on-demand scanner.
 * `clamdscan` uses the limits from `clamd.conf`; the options `--max-filesize`
   and `--max-scansize` only apply in `clamscan` mode.
-* No remaining-time estimate, only elapsed time.
+* The remaining time is an extrapolation from the speed so far, not a promise.
+* Only mounted Btrfs subvolumes are included automatically; ZFS datasets or
+  bcachefs subvolumes still count as separate filesystems.
 
 ### License
 

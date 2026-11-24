@@ -1,0 +1,35 @@
+name: ShellCheck
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Syntax check
+        run: |
+          for f in antivirus_de.sh antivirus_en.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck -x antivirus_de.sh antivirus_en.sh
+
+      # Both scripts are meant to be functionally identical and are released
+      # together, so their version numbers must match.
+      - name: Same version in both scripts
+        run: |
+          de=$(grep -m1 '^VERSION=' antivirus_de.sh)
+          en=$(grep -m1 '^VERSION=' antivirus_en.sh)
+          echo "de: $de"
+          echo "en: $en"
+          [ "$de" = "$en" ]

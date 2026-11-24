@@ -15,7 +15,7 @@
 # beides sind keine Skriptfehler.
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -43,7 +43,14 @@ BATCH_TIMEOUT=28800
 # Nützlich z.B. für Wine-/Proton-/Steam-Bäume mit hunderttausenden
 # winzigen Dateien oder für Netzlaufwerke. Beispiel:
 #   EXCLUDE_PATHS=( /opt/wine-staging "$HOME/.wine" "$HOME/.steam" )
+# Ein Scan, der INNERHALB eines ausgeschlossenen Pfads beginnt, scannt ihn
+# trotzdem — eine ausdrückliche Wahl hat Vorrang (gilt auch für
+# SNAPSHOT_PATHS und die Quarantäne).
 EXCLUDE_PATHS=()
+
+# Snapshot-Bäume wie /.snapshots von snapper (openSUSE). Sie zu scannen hieße,
+# das ganze System pro Snapshot ein weiteres Mal zu scannen.
+SNAPSHOT_PATHS=( /.snapshots )
 
 # Pseudo-Dateisysteme, die nie gescannt werden dürfen.
 PSEUDO_PATHS=( /proc /sys /dev /run /snap )
@@ -68,7 +75,9 @@ if [ -z "${BASH_VERSINFO:-}" ] ||
     exit 1
 fi
 
-APP_USER=${SUDO_USER:-${USER:-$(id -un)}}
+# Der echte Benutzer hinter sudo/doas — Protokolle und Quarantäne gehören in
+# sein Home-Verzeichnis.
+APP_USER=${SUDO_USER:-${DOAS_USER:-${USER:-$(id -un)}}}
 HOME_DIR=$(getent passwd "$APP_USER" | cut -d: -f6)
 [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || HOME_DIR="/tmp"
 QUARANTINE_PATH="$HOME_DIR/clamav_quarantine"
@@ -100,18 +109,24 @@ SKIPPED_DIRS=0
 TERM_COLS=80
 COLS_CHECKED=-1
 LAST_DRAW=-1
+FIRST_RESULT_AT=-1       # SECONDS beim ersten Ergebnis (Basis der Schätzung)
+ACTIVE_EXCLUDES=()       # was build_file_list tatsächlich auslässt
+SAME_FS_ROOTS=()         # Btrfs-Subvolumes als zusätzliche Startpunkte
 
 check_command() { command -v "$1" >/dev/null 2>&1; }
 
 # Führt einen Befehl mit root-Rechten aus — direkt, wenn wir schon root sind,
-# sonst über sudo. So läuft das Skript auch in Umgebungen ohne sudo.
+# sonst über sudo oder doas (verbreitet bei Alpine, Void oder Minimal-
+# installationen). So läuft das Skript auch in Umgebungen ohne sudo.
 as_root() {
     if [ "$EUID" -eq 0 ]; then
         "$@"
     elif check_command sudo; then
         sudo "$@"
+    elif check_command doas; then
+        doas "$@"
     else
-        echo "${YELLOW}Benötigt root-Rechte, aber sudo fehlt:${RESET} $*" >&2
+        echo "${YELLOW}Benötigt root-Rechte, aber weder sudo noch doas ist vorhanden:${RESET} $*" >&2
         return 1
     fi
 }
@@ -451,15 +466,31 @@ refresh_term_cols() {
 
 draw_progress_bar() {
     local progress=$1 total=$2 infected=$3
-    local bar_length bar pad percent filled elapsed tail
+    local bar_length bar pad percent filled elapsed tail eta="" run_s
     LAST_DRAW=$SECONDS
     refresh_term_cols
     fmt_duration elapsed $(( SECONDS - SCAN_START ))
+    # Die Uhr für die Schätzung startet mit dem ersten Ergebnis — sonst
+    # würden die 20–40 s verfälschen, die clamscan zum Laden der Datenbank
+    # braucht.
+    if [ "$progress" -gt 0 ] && [ "$FIRST_RESULT_AT" -lt 0 ]; then
+        FIRST_RESULT_AT=$SECONDS
+    fi
 
     if [ "$total" -gt 0 ]; then
         percent=$(( progress * 100 / total ))
         [ "$percent" -gt 100 ] && percent=100
-        printf -v tail ' (%d/%d) — %d Fund(e) — %s' "$progress" "$total" "$infected" "$elapsed"
+
+        # Restzeit aus dem bisherigen Durchschnittstempo. Erst nach 10 s mit
+        # Ergebnissen — frühere Werte springen zu stark, um zu nützen.
+        run_s=$(( SECONDS - FIRST_RESULT_AT ))
+        if [ "$FIRST_RESULT_AT" -ge 0 ] && [ "$run_s" -ge 10 ] &&
+           [ "$progress" -gt 0 ] && [ "$progress" -lt "$total" ]; then
+            fmt_duration eta $(( run_s * (total - progress) / progress ))
+            eta=", noch ~$eta"
+        fi
+        printf -v tail ' (%d/%d) — %d Fund(e) — %s%s' \
+            "$progress" "$total" "$infected" "$elapsed" "$eta"
 
         # Die Zeile muss schmaler als das Terminal bleiben: Bricht sie um,
         # springt "\r" nur an den Anfang des umgebrochenen Teils, und jedes
@@ -477,8 +508,14 @@ draw_progress_bar() {
                 "$CLREOL" "$GREEN" "${bar// /#}" "$GRAY" "${pad// /-}" "$RESET" \
                 "$YELLOW" "$percent" "$RESET" "$tail"
         else
-            # zu schmal für einen Balken: nur Zahlen, auf Terminalbreite gekürzt
+            # zu schmal für einen Balken: nur Zahlen — ist selbst das zu
+            # lang, entfällt die Schätzung, zuletzt wird auf Terminalbreite
+            # gekürzt
             printf -v tail '%3d%%%s' "$percent" "$tail"
+            if [ "${#tail}" -ge "$TERM_COLS" ] && [ -n "$eta" ]; then
+                printf -v tail '%3d%% (%d/%d) — %d Fund(e) — %s' \
+                    "$percent" "$progress" "$total" "$infected" "$elapsed"
+            fi
             printf '\r%s%s' "$CLREOL" "${tail:0:TERM_COLS-1}"
         fi
     else
@@ -496,23 +533,94 @@ draw_progress_bar() {
 #     läuft es in /proc/kcore und bleibt dort hängen.
 #   * Die Liste liefert zugleich die Gesamtzahl für die Prozentanzeige,
 #     ein zweiter Verzeichnisdurchlauf entfällt.
+# Setzt ACTIVE_EXCLUDES: Pseudo-Dateisysteme immer, alles andere
+# (EXCLUDE_PATHS, SNAPSHOT_PATHS, die eigene Quarantäne — ihr Inhalt würde
+# sonst bei jedem Scan erneut gemeldet) nur, wenn der Scan nicht darin
+# beginnt.
+collect_excludes() {
+    local p
+    ACTIVE_EXCLUDES=( "${PSEUDO_PATHS[@]}" "$FILE_LIST" )
+    for p in "${EXCLUDE_PATHS[@]}" "${SNAPSHOT_PATHS[@]}" "$QUARANTINE_PATH"; do
+        p=${p%/}                       # find gibt Pfade ohne abschließenden / aus
+        [ -n "$p" ] || continue
+        case "$SCAN_PATH/" in
+            "$p"/*) continue ;;        # Scan beginnt darin: ausdrückliche Wahl hat Vorrang
+        esac
+        ACTIVE_EXCLUDES+=( "$p" )
+    done
+}
+
+# path_is_excluded PFAD -> 0, wenn PFAD einer der ACTIVE_EXCLUDES ist oder
+# darunter liegt
+path_is_excluded() {
+    local p
+    for p in "${ACTIVE_EXCLUDES[@]}"; do
+        case "$1/" in
+            "$p"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Auf Btrfs hat jedes Subvolume eine eigene Gerätenummer — "-xdev" hält
+# daher auch an Subvolumes an, die Fedora oder openSUSE aus DEMSELBEN
+# Dateisystem einhängen, etwa /home, /var oder /opt. Ein Systemscan würde sie
+# stillschweigend auslassen. Setzt SAME_FS_ROOTS auf diese Einhängepunkte;
+# build_file_list nimmt sie als zusätzliche Startpunkte auf, jeweils wieder
+# mit -xdev, damit nur verschachtelte Subvolumes (snapper-Snapshots, Dockers
+# Btrfs-Speicher) weiterhin draußen bleiben.
+find_same_fs_mounts() {
+    local fstype root_id target id fsroot dev parent_dev
+    SAME_FS_ROOTS=()
+    check_command findmnt || return 0
+
+    read -r fstype root_id < <(findmnt -rn -o FSTYPE,MAJ:MIN -T "$SCAN_PATH" 2>/dev/null)
+    [ "${fstype:-}" = btrfs ] && [ -n "${root_id:-}" ] || return 0
+
+    # findmnt -r maskiert Leer- und Sonderzeichen als \xHH — printf %b macht
+    # das rückgängig. Alle Subvolumes eines Btrfs teilen sich in der
+    # Mount-Tabelle dieselbe MAJ:MIN (st_dev unterscheidet sich nur je
+    # Subvolume).
+    while read -r target id fsroot; do
+        [ "$id" = "$root_id" ] || continue
+        printf -v target '%b' "$target"
+        printf -v fsroot '%b' "$fsroot"
+        [ "$target" = "$SCAN_PATH" ] && continue
+        case "$target" in
+            "${SCAN_PATH%/}"/*) ;;
+            *) continue ;;                   # nicht unterhalb des Scanpfads
+        esac
+        case "$target/ $fsroot/" in
+            */.snapshots/*) continue ;;      # snapper-Snapshots
+        esac
+        path_is_excluded "$target" && continue
+        # Nur, wenn find NICHT ohnehin hineinläuft: Ein Bind-Mount desselben
+        # Subvolumes hat die Gerätenummer seines Elternordners und wird
+        # sowieso erreicht.
+        dev=$(stat -c %d -- "$target" 2>/dev/null) || continue
+        parent_dev=$(stat -c %d -- "$(dirname -- "$target")" 2>/dev/null) || continue
+        [ "$dev" != "$parent_dev" ] || continue
+        SAME_FS_ROOTS+=( "$target" )
+    done < <(findmnt -rn -o TARGET,MAJ:MIN,FSROOT 2>/dev/null)
+}
+
 build_file_list() {
     local -a find_opts=() prune=()
     local p counts
 
-    # Mit -xdev bleibt der Scan auf dem Dateisystem von SCAN_PATH.
-    [ "$CROSS_DEVICE" = false ] && find_opts+=( -xdev )
+    collect_excludes
+    SAME_FS_ROOTS=()
+    if [ "$CROSS_DEVICE" = false ]; then
+        # Mit -xdev bleibt der Scan auf dem Dateisystem von SCAN_PATH —
+        # plus dessen eingehängten Btrfs-Subvolumes (siehe find_same_fs_mounts).
+        find_opts+=( -xdev )
+        find_same_fs_mounts
+    fi
 
-    for p in "${PSEUDO_PATHS[@]}" "${EXCLUDE_PATHS[@]}" "$FILE_LIST"; do
+    for p in "${ACTIVE_EXCLUDES[@]}"; do
         [ -n "$p" ] || continue
         prune+=( -path "$p" -o )
     done
-    # Die eigene Quarantäne nie scannen (ihr Inhalt würde sonst bei jedem
-    # Scan erneut gemeldet) — außer der Scan beginnt bewusst darin.
-    case "$SCAN_PATH/" in
-        "$QUARANTINE_PATH"/*) ;;
-        *) prune+=( -path "$QUARANTINE_PATH" -o ) ;;
-    esac
     # letztes "-o" wieder entfernen
     unset 'prune[${#prune[@]}-1]'
 
@@ -522,7 +630,7 @@ build_file_list() {
     #     stdout, die gezählt wird, damit die Zusammenfassung sagen kann,
     #     wie viel übersprungen wurde
     # -H: Ist SCAN_PATH selbst ein Symlink, wird ihm gefolgt (nur dem Startpunkt).
-    counts=$(find -H "$SCAN_PATH" "${find_opts[@]}" \
+    counts=$(find -H "$SCAN_PATH" "${SAME_FS_ROOTS[@]}" "${find_opts[@]}" \
                   \( "${prune[@]}" \) -prune -o \
                   -type d \( ! -readable -o ! -executable \) -printf 'd\n' -prune -o \
                   -type f \( -readable -fprint "$FILE_LIST" -o -printf 'f\n' \) \
@@ -594,6 +702,7 @@ perform_scan() {
 
     # Zustand eines vorherigen Scans in dieser Sitzung zurücksetzen
     QUARANTINE_DIR=""; RESULTS_FILE=""; SKIPPED_FILES=0; SKIPPED_DIRS=0
+    FIRST_RESULT_AT=-1; SAME_FS_ROOTS=()
 
     update_signatures
 
@@ -697,7 +806,7 @@ perform_scan() {
 
     # --- Umfang --------------------------------------------------------------
     echo
-    if ask_yes_no "Auch eingehängte Dateisysteme mitscannen (z.B. separates /home, Btrfs-Subvolumes, USB)?" n; then
+    if ask_yes_no "Auch eingehängte Dateisysteme mitscannen (z.B. separate /home-Partition, USB)?" n; then
         CROSS_DEVICE=true
     else
         CROSS_DEVICE=false
@@ -710,6 +819,9 @@ perform_scan() {
     build_file_list
 
     total=$(wc -l < "$FILE_LIST")
+    if [ "${#SAME_FS_ROOTS[@]}" -gt 0 ]; then
+        echo "Inklusive Btrfs-Subvolumes desselben Dateisystems: ${SAME_FS_ROOTS[*]}"
+    fi
     echo "Zu scannen: $total Dateien"
     if [ $(( SKIPPED_FILES + SKIPPED_DIRS )) -gt 0 ]; then
         echo "${YELLOW}Nicht lesbar, übersprungen:${RESET} $SKIPPED_FILES Dateien, $SKIPPED_DIRS Verzeichnisse"
@@ -726,6 +838,7 @@ perform_scan() {
         echo "Skriptversion: $VERSION"
         echo "Pfad:     $SCAN_PATH"
         echo "Umfang:   $([ "$CROSS_DEVICE" = true ] && echo "inkl. eingehängter Dateisysteme" || echo "nur eigenes Dateisystem (-xdev)")"
+        [ "${#SAME_FS_ROOTS[@]}" -gt 0 ] && echo "Subvols:  ${SAME_FS_ROOTS[*]}"
         echo "Scanner:  $([ "$use_clamdscan" = true ] && echo clamdscan || echo clamscan)"
         echo "Flags:    ${flags[*]}"
         [ "$use_clamdscan" = true ] && echo "Threads:  $THREADS"
@@ -1031,7 +1144,7 @@ perform_scan() {
         echo
         echo "${YELLOW}Hinweis:${RESET} Nicht alles war lesbar ($errors Lesefehler;"
         echo "übersprungen: $SKIPPED_FILES Dateien, $SKIPPED_DIRS Verzeichnisse)."
-        echo "Für einen vollständigen Systemscan das Skript mit sudo starten."
+        echo "Für einen vollständigen Systemscan das Skript mit sudo (oder doas) starten."
     fi
     return 0
 }
