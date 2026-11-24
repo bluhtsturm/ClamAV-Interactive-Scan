@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# antivirus.sh — interaktiver ClamAV-Scanner mit Fortschrittsanzeige
+# antivirus_de.sh — interaktiver ClamAV-Scanner mit Fortschrittsanzeige
 #
 # Scannt das laufende System, ein externes Laufwerk oder ein beliebiges
 # Verzeichnis. Wahlweise mit clamscan (eigener Prozess, lädt die Signatur-
@@ -15,7 +15,7 @@
 # beides sind keine Skriptfehler.
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -48,6 +48,13 @@ EXCLUDE_PATHS=()
 # Pseudo-Dateisysteme, die nie gescannt werden dürfen.
 PSEUDO_PATHS=( /proc /sys /dev /run /snap )
 
+# Die Dienstnamen unterscheiden sich je nach Distribution:
+#   clamav-daemon / clamav-freshclam   Debian, Ubuntu, Arch (Upstream-Namen)
+#   clamd@scan    / clamav-freshclam   Fedora, RHEL
+#   clamd         / freshclam          openSUSE
+CLAMD_UNITS=( clamav-daemon clamd@scan clamd )
+FRESHCLAM_UNITS=( clamav-freshclam freshclam )
+
 # ---------------------------------------------------------------------------
 # Vorbedingungen
 # ---------------------------------------------------------------------------
@@ -64,6 +71,7 @@ fi
 APP_USER=${SUDO_USER:-${USER:-$(id -un)}}
 HOME_DIR=$(getent passwd "$APP_USER" | cut -d: -f6)
 [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ] || HOME_DIR="/tmp"
+QUARANTINE_PATH="$HOME_DIR/clamav_quarantine"
 
 # Farben nur, wenn stdout wirklich ein Terminal ist.
 # $'...' (ANSI-C-Quoting) legt die echten Escape-Bytes in die Variable —
@@ -77,15 +85,21 @@ else
     CLREOL=""; HIDE=""; SHOW=""
 fi
 
-FRESHCLAM_WAS_RUNNING=false
-QUARANTINE_DIR=""
+FRESHCLAM_UNIT=""        # der von uns gestoppte freshclam-Dienst (zum Neustart)
+QUARANTINE_DIR=""        # nur gesetzt, solange der aktuelle Scan die Quarantäne nutzt
 RESULTS_FILE=""
 FILE_LIST=""
 CHUNK_DIR=""
+RC_FILE=""
 RUN_PID=""
 CLEANED=false
 CROSS_DEVICE=false
 THREADS=1
+SKIPPED_FILES=0          # nicht lesbar, daher nicht in der Dateiliste
+SKIPPED_DIRS=0
+TERM_COLS=80
+COLS_CHECKED=-1
+LAST_DRAW=-1
 
 check_command() { command -v "$1" >/dev/null 2>&1; }
 
@@ -142,6 +156,23 @@ kill_workers() {
     return 0
 }
 
+# Entfernt die Temporärdateien eines Scans und übergibt dessen Protokoll
+# dem echten Benutzer. Läuft nach JEDEM Scan, nicht erst beim Beenden —
+# sonst sammeln sich bei mehreren Scans pro Sitzung Temporärdateien an und
+# ältere Protokolle bleiben root-eigen liegen.
+finish_scan() {
+    [ -n "$FILE_LIST" ] && rm -f "$FILE_LIST"
+    [ -n "$CHUNK_DIR" ] && rm -rf "$CHUNK_DIR"
+    [ -n "$RC_FILE" ]   && rm -f "$RC_FILE"
+    FILE_LIST=""; CHUNK_DIR=""; RC_FILE=""
+
+    # Logdatei dem echten Benutzer übergeben, nicht root
+    if [ "$EUID" -eq 0 ] && [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
+        chown "$APP_USER:" "$RESULTS_FILE" 2>/dev/null
+    fi
+    return 0
+}
+
 cleanup() {
     # Der EXIT-Trap feuert auch nach einem Signal-Trap — ohne Wachposten
     # liefe das Aufräumen zweimal.
@@ -152,17 +183,11 @@ cleanup() {
     kill_workers
 
     # freshclam-Dienst wieder starten, falls wir ihn gestoppt haben
-    if [ "$FRESHCLAM_WAS_RUNNING" = true ]; then
-        as_root systemctl start clamav-freshclam >/dev/null 2>&1
+    if [ -n "$FRESHCLAM_UNIT" ]; then
+        as_root systemctl start "$FRESHCLAM_UNIT" >/dev/null 2>&1
     fi
 
-    [ -n "$FILE_LIST" ] && rm -f "$FILE_LIST"
-    [ -n "$CHUNK_DIR" ] && rm -rf "$CHUNK_DIR"
-
-    # Logdatei dem echten Benutzer übergeben, nicht root
-    if [ "$EUID" -eq 0 ] && [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
-        chown "$APP_USER:" "$RESULTS_FILE" 2>/dev/null
-    fi
+    finish_scan
     return 0
 }
 
@@ -195,13 +220,15 @@ ask_line() {
     printf '%s' "$reply"
 }
 
-# Sekunden -> HH:MM:SS bzw. MM:SS
+# fmt_duration VAR Sekunden  -> VAR = HH:MM:SS bzw. MM:SS
+# Schreibt in eine Variable statt nach stdout, damit Aufrufer keine
+# $(...)-Subshell brauchen — der Fortschrittsbalken ruft das sekündlich auf.
 fmt_duration() {
-    local s=$1
+    local s=$2
     if [ "$s" -ge 3600 ]; then
-        printf '%d:%02d:%02d' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 ))
+        printf -v "$1" '%d:%02d:%02d' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 ))
     else
-        printf '%02d:%02d' $(( s / 60 )) $(( s % 60 ))
+        printf -v "$1" '%02d:%02d' $(( s / 60 )) $(( s % 60 ))
     fi
 }
 
@@ -242,6 +269,10 @@ if ! check_command clamscan && ! check_command clamdscan; then
     echo "ClamAV wurde nicht gefunden."
     if ask_yes_no "Jetzt installieren?" j; then
         install_clamav
+        if ! check_command clamscan && ! check_command clamdscan; then
+            echo "${RED}ClamAV ist weiterhin nicht verfügbar — ist die Installation fehlgeschlagen?${RESET}"
+            exit 1
+        fi
     else
         echo "Ohne ClamAV kann nicht fortgefahren werden. Abbruch."
         exit 1
@@ -253,23 +284,26 @@ fi
 # ---------------------------------------------------------------------------
 
 update_signatures() {
+    local unit
     echo
     ask_yes_no "Virensignaturen aktualisieren?" j || return 0
 
     # freshclam kann nicht laufen, solange der Dienst die Logdatei sperrt.
-    if systemctl is-active --quiet clamav-freshclam 2>/dev/null; then
-        echo "Stoppe clamav-freshclam für die Dauer des Updates ..."
-        as_root systemctl stop clamav-freshclam && FRESHCLAM_WAS_RUNNING=true
-    fi
+    for unit in "${FRESHCLAM_UNITS[@]}"; do
+        systemctl is-active --quiet "$unit" 2>/dev/null || continue
+        echo "Stoppe $unit für die Dauer des Updates ..."
+        as_root systemctl stop "$unit" && FRESHCLAM_UNIT=$unit
+        break
+    done
 
     echo "Aktualisiere Signaturen ..."
     if ! as_root freshclam; then
         echo "${YELLOW}Warnung:${RESET} Update fehlgeschlagen — es wird mit den vorhandenen Signaturen gescannt."
     fi
 
-    if [ "$FRESHCLAM_WAS_RUNNING" = true ]; then
-        as_root systemctl start clamav-freshclam >/dev/null 2>&1
-        FRESHCLAM_WAS_RUNNING=false
+    if [ -n "$FRESHCLAM_UNIT" ]; then
+        as_root systemctl start "$FRESHCLAM_UNIT" >/dev/null 2>&1
+        FRESHCLAM_UNIT=""
     fi
 }
 
@@ -278,21 +312,35 @@ update_signatures() {
 # ---------------------------------------------------------------------------
 
 start_clamd_if_needed() {
-    if systemctl is-active --quiet clamav-daemon 2>/dev/null ||
-       systemctl is-active --quiet clamd@scan    2>/dev/null ||
-       systemctl is-active --quiet clamd         2>/dev/null; then
-        return 0
+    local unit="" u i
+
+    # Antwortet er schon? Dann ist egal, wie er gestartet wurde
+    # (systemd, von Hand, im Container ...).
+    clamdscan --ping 1 >/dev/null 2>&1 && return 0
+
+    for u in "${CLAMD_UNITS[@]}"; do
+        if systemctl is-active --quiet "$u" 2>/dev/null; then
+            unit=$u
+            break
+        fi
+    done
+    if [ -z "$unit" ]; then
+        # die erste Unit starten, die es auf diesem System tatsächlich gibt
+        for u in "${CLAMD_UNITS[@]}"; do
+            systemctl cat "$u" >/dev/null 2>&1 || continue
+            echo "Starte clamd ($u) ..."
+            as_root systemctl start "$u" && unit=$u
+            break
+        done
+    fi
+    if [ -z "$unit" ]; then
+        echo "${YELLOW}Kein clamd-Dienst gefunden, oder er ließ sich nicht starten.${RESET}"
+        return 1
     fi
 
-    echo "Starte clamd ..."
-    case "$(detect_family)" in
-        debian) as_root systemctl start clamav-daemon ;;
-        fedora) as_root systemctl start clamd@scan ;;
-        *)      as_root systemctl start clamd ;;
-    esac
-
-    # clamd braucht nach dem Start bis zu ~60 s zum Laden der Datenbank
-    local i
+    # "active" heißt nicht bereit: Nach einem (Neu-)Start braucht clamd bis
+    # zu ~60 s zum Laden der Signaturdatenbank und antwortet erst danach.
+    echo "Warte auf clamd (das Laden der Datenbank kann bis zu einer Minute dauern) ..."
     for (( i = 0; i < 60; i++ )); do
         clamdscan --ping 1 >/dev/null 2>&1 && return 0
         sleep 1
@@ -352,6 +400,12 @@ select_custom_path() {
     input=$(ask_line "Pfad eingeben: ")
     [ -n "$input" ] || return 1
 
+    # Drag & Drop aus dem Dateimanager fügt den Pfad in Anführungszeichen
+    # ein: '/home/ich/Meine Dateien'
+    case "$input" in
+        \'*\'|\"*\") input=${input:1:${#input}-2} ;;
+    esac
+
     # Führende Tilde selbst auflösen — read expandiert sie nicht.
     # shellcheck disable=SC2088  # die Tilde ist hier Absicht: Suchmuster, keine Expansion
     case "$input" in
@@ -363,29 +417,70 @@ select_custom_path() {
         echo "Pfad existiert nicht: $input"
         return 1
     fi
-    SCAN_PATH="$input"
+
+    # Pfad absolut machen: clamscan gibt jeden Pfad genau so aus, wie er in
+    # der Dateiliste steht, und die Auswertung erkennt nur Zeilen, die mit
+    # "/" beginnen — bei einem relativen Pfad würde nichts gezählt.
+    # Symlinks werden bewusst NICHT aufgelöst (-s), damit EXCLUDE_PATHS
+    # weiterhin greifen.
+    case "$input" in
+        /*) ;;
+        *)  input="$PWD/$input" ;;
+    esac
+    SCAN_PATH=$(realpath -s -- "$input" 2>/dev/null) || SCAN_PATH=$input
     return 0
 }
 
 # ---------------------------------------------------------------------------
-# Fortschrittsbalken (ohne Subprozesse, ohne seq)
+# Fortschrittsbalken
 # ---------------------------------------------------------------------------
+
+# Liest die Terminalbreite höchstens einmal pro Sekunde neu ein — das
+# Fenster kann während eines langen Scans verändert werden.
+refresh_term_cols() {
+    local size
+    [ "$SECONDS" -eq "$COLS_CHECKED" ] && return 0
+    COLS_CHECKED=$SECONDS
+    size=$(stty size 2>/dev/null < /dev/tty) || return 0
+    size=${size##* }
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+        TERM_COLS=$size
+    fi
+    return 0
+}
 
 draw_progress_bar() {
     local progress=$1 total=$2 infected=$3
-    local bar_length=40 bar pad percent filled elapsed
-    elapsed=$(fmt_duration $(( SECONDS - SCAN_START )))
+    local bar_length bar pad percent filled elapsed tail
+    LAST_DRAW=$SECONDS
+    refresh_term_cols
+    fmt_duration elapsed $(( SECONDS - SCAN_START ))
 
     if [ "$total" -gt 0 ]; then
         percent=$(( progress * 100 / total ))
         [ "$percent" -gt 100 ] && percent=100
-        filled=$(( progress * bar_length / total ))
-        [ "$filled" -gt "$bar_length" ] && filled=$bar_length
-        printf -v bar '%*s' "$filled" ''
-        printf -v pad '%*s' "$(( bar_length - filled ))" ''
-        printf '\r%s[%s%s%s%s%s] %s%3d%%%s (%d/%d) — %d Fund(e) — %s' \
-            "$CLREOL" "$GREEN" "${bar// /#}" "$GRAY" "${pad// /-}" "$RESET" \
-            "$YELLOW" "$percent" "$RESET" "$progress" "$total" "$infected" "$elapsed"
+        printf -v tail ' (%d/%d) — %d Fund(e) — %s' "$progress" "$total" "$infected" "$elapsed"
+
+        # Die Zeile muss schmaler als das Terminal bleiben: Bricht sie um,
+        # springt "\r" nur an den Anfang des umgebrochenen Teils, und jedes
+        # Neuzeichnen hinterlässt eine Kopie. Neben dem Balken braucht sie
+        # "[", "] ", "100%", den Rest der Zeile und eine Spalte Reserve.
+        bar_length=$(( TERM_COLS - ${#tail} - 8 ))
+        [ "$bar_length" -gt 40 ] && bar_length=40
+
+        if [ "$bar_length" -ge 10 ]; then
+            filled=$(( progress * bar_length / total ))
+            [ "$filled" -gt "$bar_length" ] && filled=$bar_length
+            printf -v bar '%*s' "$filled" ''
+            printf -v pad '%*s' "$(( bar_length - filled ))" ''
+            printf '\r%s[%s%s%s%s%s] %s%3d%%%s%s' \
+                "$CLREOL" "$GREEN" "${bar// /#}" "$GRAY" "${pad// /-}" "$RESET" \
+                "$YELLOW" "$percent" "$RESET" "$tail"
+        else
+            # zu schmal für einen Balken: nur Zahlen, auf Terminalbreite gekürzt
+            printf -v tail '%3d%%%s' "$percent" "$tail"
+            printf '\r%s%s' "$CLREOL" "${tail:0:TERM_COLS-1}"
+        fi
     else
         printf '\r%s%s%d%s Dateien geprüft — %d Fund(e) — %s' \
             "$CLREOL" "$YELLOW" "$progress" "$RESET" "$infected" "$elapsed"
@@ -403,34 +498,102 @@ draw_progress_bar() {
 #     ein zweiter Verzeichnisdurchlauf entfällt.
 build_file_list() {
     local -a find_opts=() prune=()
-    local p
+    local p counts
 
-    # Ohne -xdev bleibt der Scan auf dem Dateisystem von SCAN_PATH.
+    # Mit -xdev bleibt der Scan auf dem Dateisystem von SCAN_PATH.
     [ "$CROSS_DEVICE" = false ] && find_opts+=( -xdev )
 
-    for p in "${PSEUDO_PATHS[@]}" "${EXCLUDE_PATHS[@]}" "$QUARANTINE_DIR" "$FILE_LIST"; do
+    for p in "${PSEUDO_PATHS[@]}" "${EXCLUDE_PATHS[@]}" "$FILE_LIST"; do
         [ -n "$p" ] || continue
         prune+=( -path "$p" -o )
     done
+    # Die eigene Quarantäne nie scannen (ihr Inhalt würde sonst bei jedem
+    # Scan erneut gemeldet) — außer der Scan beginnt bewusst darin.
+    case "$SCAN_PATH/" in
+        "$QUARANTINE_PATH"/*) ;;
+        *) prune+=( -path "$QUARANTINE_PATH" -o ) ;;
+    esac
     # letztes "-o" wieder entfernen
-    [ "${#prune[@]}" -gt 0 ] && unset 'prune[${#prune[@]}-1]'
+    unset 'prune[${#prune[@]}-1]'
 
-    if [ "${#prune[@]}" -gt 0 ]; then
-        find "$SCAN_PATH" "${find_opts[@]}" \
-             \( "${prune[@]}" \) -prune \
-             -o -type f -readable -print 2>/dev/null > "$FILE_LIST"
-    else
-        find "$SCAN_PATH" "${find_opts[@]}" \
-             -type f -readable -print 2>/dev/null > "$FILE_LIST"
-    fi
+    # Ein Durchlauf, drei Ergebnisse:
+    #   * lesbare Dateien                   -> in die Dateiliste (-fprint)
+    #   * nicht lesbare Dateien und Ordner  -> je eine "f"/"d"-Zeile auf
+    #     stdout, die gezählt wird, damit die Zusammenfassung sagen kann,
+    #     wie viel übersprungen wurde
+    # -H: Ist SCAN_PATH selbst ein Symlink, wird ihm gefolgt (nur dem Startpunkt).
+    counts=$(find -H "$SCAN_PATH" "${find_opts[@]}" \
+                  \( "${prune[@]}" \) -prune -o \
+                  -type d \( ! -readable -o ! -executable \) -printf 'd\n' -prune -o \
+                  -type f \( -readable -fprint "$FILE_LIST" -o -printf 'f\n' \) \
+                  2>/dev/null |
+             awk '{ n[$0]++ } END { printf "%d %d\n", n["f"], n["d"] }')
+    read -r SKIPPED_FILES SKIPPED_DIRS <<< "$counts"
+    [[ "$SKIPPED_FILES" =~ ^[0-9]+$ ]] || SKIPPED_FILES=0
+    [[ "$SKIPPED_DIRS"  =~ ^[0-9]+$ ]] || SKIPPED_DIRS=0
+}
+
+# ---------------------------------------------------------------------------
+# Auswertung der Scannerausgabe (gemeinsam für beide Scan-Pfade)
+# ---------------------------------------------------------------------------
+
+# Wertet eine Ausgabezeile von clamscan/clamdscan aus.
+#   $1 = die Zeile (CR bereits entfernt), $2 = ihre Quelle (Paketdatei oder
+#        "serial"), damit der Zusammenfassungsblock je Quelle getrennt
+#        verfolgt wird.
+# Ändert scanned/infected/errors/last_file/IN_SUMMARY aus perform_scan
+# (Bash-Scoping: eine Funktion sieht die "local"-Variablen aller
+# Funktionen, aus denen heraus sie aufgerufen wurde).
+handle_output_line() {
+    local line=$1 src=$2
+    case "$line" in
+        *"SCAN SUMMARY"*) IN_SUMMARY[$src]=true;  return ;;
+        "Time:"*)         IN_SUMMARY[$src]=false; return ;;
+        /*:\ *)           IN_SUMMARY[$src]=false ;;
+    esac
+    [ "${IN_SUMMARY[$src]:-false}" = true ] && return
+
+    case "$line" in
+        *"PAKET-ABBRUCH ("*|"Stehengeblieben bei:"*|"Komplette Paketliste"*)
+            printf '\r%s%s%s%s\n' "$CLREOL" "$YELLOW" "$line" "$RESET"
+            printf '%s\n' "$line" >> "$RESULTS_FILE"
+            ;;
+        # Reguläre Ergebnisse zuerst: Eine Datei, die "ERROR" oder
+        # "Can't open" bloß im NAMEN trägt, darf nicht als Lesefehler zählen.
+        /*": OK"|/*": Empty file")
+            last_file=${line%: *}
+            scanned=$(( scanned + 1 ))
+            ;;
+        *" FOUND")
+            scanned=$(( scanned + 1 )); infected=$(( infected + 1 ))
+            printf '\r%s%s%s%s\n' "$CLREOL" "$RED" "$line" "$RESET"
+            printf '%s\n' "$line" >> "$RESULTS_FILE"
+            ;;
+        *ERROR*|*"Access denied"*|*"Can't open"*|*"Can't access"*)
+            # Auch nicht lesbare Dateien sind abgearbeitet — sonst erreicht
+            # der Balken nie 100 %.
+            scanned=$(( scanned + 1 )); errors=$(( errors + 1 ))
+            printf '%s\n' "$line" >> "$RESULTS_FILE"
+            ;;
+        LibClamAV*|WARNING*|Loading*|"Session terminated"*|"")
+            : # Vorlauf- und Statusmeldungen ignorieren
+            ;;
+        /*:\ *)
+            last_file=${line%: *}
+            scanned=$(( scanned + 1 ))
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
 # Der eigentliche Scan
 # ---------------------------------------------------------------------------
 
-run_scan() {
+perform_scan() {
     local flags=() use_clamdscan=false total=0 ans action confirm
+
+    # Zustand eines vorherigen Scans in dieser Sitzung zurücksetzen
+    QUARANTINE_DIR=""; RESULTS_FILE=""; SKIPPED_FILES=0; SKIPPED_DIRS=0
 
     update_signatures
 
@@ -443,7 +606,7 @@ run_scan() {
     action=$(ask_line "Auswahl [1]: ")
     case "${action:-1}" in
         2)
-            QUARANTINE_DIR="$HOME_DIR/clamav_quarantine"
+            QUARANTINE_DIR="$QUARANTINE_PATH"
             mkdir -p "$QUARANTINE_DIR" 2>/dev/null || as_root mkdir -p "$QUARANTINE_DIR"
             chmod 700 "$QUARANTINE_DIR" 2>/dev/null || as_root chmod 700 "$QUARANTINE_DIR"
             [ "$EUID" -eq 0 ] && chown "$APP_USER:" "$QUARANTINE_DIR" 2>/dev/null
@@ -534,7 +697,7 @@ run_scan() {
 
     # --- Umfang --------------------------------------------------------------
     echo
-    if ask_yes_no "Auch eingehängte Dateisysteme mitscannen (z.B. separates /home, USB)?" n; then
+    if ask_yes_no "Auch eingehängte Dateisysteme mitscannen (z.B. separates /home, Btrfs-Subvolumes, USB)?" n; then
         CROSS_DEVICE=true
     else
         CROSS_DEVICE=false
@@ -548,6 +711,9 @@ run_scan() {
 
     total=$(wc -l < "$FILE_LIST")
     echo "Zu scannen: $total Dateien"
+    if [ $(( SKIPPED_FILES + SKIPPED_DIRS )) -gt 0 ]; then
+        echo "${YELLOW}Nicht lesbar, übersprungen:${RESET} $SKIPPED_FILES Dateien, $SKIPPED_DIRS Verzeichnisse"
+    fi
     if [ "$total" -eq 0 ]; then
         echo "Nichts zu scannen."
         return 0
@@ -564,10 +730,12 @@ run_scan() {
         echo "Flags:    ${flags[*]}"
         [ "$use_clamdscan" = true ] && echo "Threads:  $THREADS"
         echo "Dateien:  $total"
+        echo "Übersprungen: $SKIPPED_FILES Dateien, $SKIPPED_DIRS Verzeichnisse (nicht lesbar)"
         echo "-------------------------------------------"
     } > "$RESULTS_FILE"
 
     local scanned=0 infected=0 errors=0 last_file="" scanner
+    local -A IN_SUMMARY=()
     scanner=clamscan
     [ "$use_clamdscan" = true ] && scanner=clamdscan
 
@@ -585,6 +753,10 @@ run_scan() {
         # -a 4: Suffixlänge 4 statt 2 — sonst ist bei mehr als 676 Paketen
         # (also ~1,35 Mio. Dateien) Schluss und split bricht ab.
         split -a 4 -l "$CHUNK_SIZE" "$FILE_LIST" "$CHUNK_DIR/part_"
+        # Die Menge der Pakete steht ab hier fest. "part_????" trifft nur die
+        # Pakete selbst (4-stelliges Suffix), nicht die später angelegten
+        # .out/.rc/.pid-Dateien.
+        local -a CHUNKS=( "$CHUNK_DIR"/part_???? )
 
         # Jeder Worker scannt genau ein Paket über eine eigene Verbindung und
         # schreibt in seine eigene Ausgabedatei statt auf ein gemeinsames
@@ -594,15 +766,18 @@ run_scan() {
         # dafür GNU parallel oder xargs -P nötig wäre.
         run_scanner_parallel() {
             local chunk c active=0
-            for chunk in "$CHUNK_DIR"/part_*; do
+            for chunk in "${CHUNKS[@]}"; do
                 (
-                    local wrc tpid done_n=0 total_n suspect saved ln reason
+                    local wrc tpid done_n=0 total_n suspect saved ln reason=""
                     printf -v c '%q ' "$scanner" "${flags[@]}" "--file-list=$chunk"
 
                     # Im Hintergrund starten und die PID hinterlegen, damit der
                     # Monitor das Paket bei Stillstand gezielt beenden kann.
+                    # SHELL: 'script' führt den Befehl über $SHELL aus, und das
+                    # %q-Quoting oben ist Bash-Syntax — mit fish oder einer
+                    # anderen Login-Shell könnte es falsch gelesen werden.
                     if check_command script; then
-                        timeout -k 30 "$BATCH_TIMEOUT" script -qfec "$c" /dev/null \
+                        SHELL="$BASH" timeout -k 30 "$BATCH_TIMEOUT" script -qfec "$c" /dev/null \
                             < /dev/null > "$chunk.out" 2>&1 &
                     else
                         timeout -k 30 "$BATCH_TIMEOUT" stdbuf -oL "$scanner" \
@@ -614,40 +789,42 @@ run_scan() {
                     wrc=$?
                     rm -f "$chunk.pid"
 
-                    # 124 = absolute Obergrenze, 137/143 = vom Monitor wegen
-                    # Stillstand beendet. Alles andere ist ein normales Ende.
-                    case "$wrc" in
-                        124|137|143)
-                            if [ -f "$chunk.stalled" ]; then
-                                reason="kein Fortschritt seit ${STALL_TIMEOUT}s"
-                            else
-                                reason="absolute Obergrenze erreicht"
-                            fi
-                            # Zahl der bereits geschriebenen Ergebniszeilen =
-                            # Dateien, die fertig wurden. Die nächste Zeile der
-                            # Paketliste ist die, an der es stehenblieb.
-                            while IFS= read -r ln; do
-                                ln=${ln%$'\r'}
-                                case "$ln" in
-                                    LibClamAV*|WARNING*|Loading*|"Session terminated"*|"") : ;;
-                                    *) done_n=$(( done_n + 1 )) ;;
-                                esac
-                            done < "$chunk.out"
-                            total_n=$(wc -l < "$chunk")
-                            suspect=$(sed -n "$((done_n + 1))p" "$chunk")
-                            saved="$HOME_DIR/clamav_abbruch_$(basename "$chunk")_$(date +%H%M%S).list"
-                            if cp "$chunk" "$saved" 2>/dev/null; then
-                                [ "$EUID" -eq 0 ] && chown "$APP_USER:" "$saved" 2>/dev/null
-                            fi
-                            {
-                                printf '\nPAKET-ABBRUCH (%s): %d/%d Dateien geschafft\n' \
-                                    "$reason" "$done_n" "$total_n"
-                                printf 'Stehengeblieben bei: %s\n' "${suspect:-unbekannt}"
-                                printf 'Komplette Paketliste gesichert unter: %s\n' "$saved"
-                            } >> "$chunk.out"
-                            wrc=2
-                            ;;
-                    esac
+                    # Abgebrochen? Die Stillstandsmarke des Monitors ist das
+                    # verlässliche Signal — der Exit-Code nach einem Kill hängt
+                    # davon ab, wie script und die Shell das Signal melden.
+                    # Ohne Marke heißt 124 (bzw. 137, falls timeout SIGKILL
+                    # brauchte) absolute Obergrenze. Alles andere ist ein
+                    # normales Ende.
+                    if [ -f "$chunk.stalled" ]; then
+                        reason="kein Fortschritt seit ${STALL_TIMEOUT}s"
+                    elif [ "$wrc" -eq 124 ] || [ "$wrc" -eq 137 ]; then
+                        reason="absolute Obergrenze erreicht"
+                    fi
+                    if [ -n "$reason" ]; then
+                        # Zahl der bereits geschriebenen Ergebniszeilen =
+                        # Dateien, die fertig wurden. Die nächste Zeile der
+                        # Paketliste ist die, an der es stehenblieb.
+                        while IFS= read -r ln; do
+                            ln=${ln%$'\r'}
+                            case "$ln" in
+                                LibClamAV*|WARNING*|Loading*|"Session terminated"*|"") : ;;
+                                *) done_n=$(( done_n + 1 )) ;;
+                            esac
+                        done < "$chunk.out"
+                        total_n=$(wc -l < "$chunk")
+                        suspect=$(sed -n "$((done_n + 1))p" "$chunk")
+                        saved="$HOME_DIR/clamav_abbruch_$(basename "$chunk")_$(date +%H%M%S).list"
+                        if cp "$chunk" "$saved" 2>/dev/null; then
+                            [ "$EUID" -eq 0 ] && chown "$APP_USER:" "$saved" 2>/dev/null
+                        fi
+                        {
+                            printf '\nPAKET-ABBRUCH (%s): %d/%d Dateien geschafft\n' \
+                                "$reason" "$done_n" "$total_n"
+                            printf 'Stehengeblieben bei: %s\n' "${suspect:-unbekannt}"
+                            printf 'Komplette Paketliste gesichert unter: %s\n' "$saved"
+                        } >> "$chunk.out"
+                        wrc=2
+                    fi
                     echo "$wrc" > "$chunk.rc"
                 # Alle Nutzdaten der Worker landen in $chunk.out/.rc/.pid.
                 # Was sonst noch auf stdout/stderr fällt, sind nur
@@ -663,46 +840,6 @@ run_scan() {
             wait
         }
 
-        # Wertet eine einzelne neue Zeile aus einer Paket-Ausgabedatei aus.
-        # Nutzt scanned/infected/errors/last_file/RESULTS_FILE aus run_scan
-        # und IN_SUMMARY aus monitor_parallel (Bash-Scoping: ein Aufruf sieht
-        # die "local"-Variablen aller Funktionen, aus denen heraus er
-        # aufgerufen wurde).
-        categorize_line() {
-            local line=$1 chunk=$2
-            case "$line" in
-                *"SCAN SUMMARY"*) IN_SUMMARY[$chunk]=true;  return ;;
-                "Time:"*)         IN_SUMMARY[$chunk]=false; return ;;
-                /*:\ *)           IN_SUMMARY[$chunk]=false ;;
-            esac
-            [ "${IN_SUMMARY[$chunk]:-false}" = true ] && return
-
-            case "$line" in
-                *"PAKET-ABBRUCH ("*|"Stehengeblieben bei:"*|"Komplette Paketliste"*)
-                    printf '\r%s%s%s%s\n' "$CLREOL" "$YELLOW" "$line" "$RESET"
-                    printf '%s\n' "$line" >> "$RESULTS_FILE"
-                    ;;
-                *" FOUND")
-                    scanned=$(( scanned + 1 )); infected=$(( infected + 1 ))
-                    printf '\r%s%s%s%s\n' "$CLREOL" "$RED" "$line" "$RESET"
-                    printf '%s\n' "$line" >> "$RESULTS_FILE"
-                    ;;
-                *ERROR*|*"Access denied"*|*"Can't open"*|*"Can't access"*)
-                    # Auch nicht lesbare Dateien sind abgearbeitet — sonst
-                    # erreicht der Balken nie 100 %.
-                    scanned=$(( scanned + 1 )); errors=$(( errors + 1 ))
-                    printf '%s\n' "$line" >> "$RESULTS_FILE"
-                    ;;
-                LibClamAV*|WARNING*|Loading*|"Session terminated"*|"")
-                    : # Vorlauf- und Statusmeldungen ignorieren
-                    ;;
-                /*:\ *)
-                    last_file=${line%%:*}
-                    scanned=$(( scanned + 1 ))
-                    ;;
-            esac
-        }
-
         # Liest bei jedem Aufruf nur die seit dem letzten Mal neu
         # hinzugekommenen VOLLSTÄNDIGEN Zeilen einer Datei nach. "wc -l"
         # zählt ausschließlich zeilenendenterminierte Zeilen — eine gerade
@@ -710,26 +847,33 @@ run_scan() {
         # und automatisch bis zum nächsten Durchlauf zurückgestellt. Damit
         # entfällt jede manuelle Verwaltung unvollständiger Zeilenreste.
         poll_chunk_outputs() {
-            local chunk out_file new_total prev line
-            # "! -name '*.*'": passt nur auf die von split erzeugten Pakete
-            # (part_aaaa ...), nicht auf deren eigene .out/.rc-Dateien —
-            # sonst wird die Trefferliste bei jedem Poll unnötig größer.
-            while IFS= read -r -d '' chunk; do
+            local chunk out_file new_total prev line finished
+            for chunk in "${CHUNKS[@]}"; do
+                # Fertige Pakete werden nie wieder angefasst — sonst kostet
+                # jeder Poll ein wc pro Paket, gegen Ende eines großen Scans
+                # also Hunderte Prozessstarts pro Sekunde.
+                [ -n "${DONE_CHUNKS[$chunk]:-}" ] && continue
                 out_file="$chunk.out"
                 [ -f "$out_file" ] || continue
+                # .rc wird erst nach der letzten Ausgabezeile geschrieben.
+                # Existiert sie JETZT, ist das unten Gelesene die komplette
+                # Ausgabe.
+                finished=false
+                [ -f "$chunk.rc" ] && finished=true
                 new_total=$(wc -l < "$out_file" 2>/dev/null) || new_total=0
                 prev=${SEEN_LINES[$chunk]:-0}
-                [ "$new_total" -le "$prev" ] && continue
-                while IFS= read -r line; do
-                    # 'script' liefert CRLF — ohne das Abschneiden hier matcht
-                    # z.B. das Muster '*" FOUND"' nicht mehr, weil die Zeile
-                    # dann auf "FOUND\r" statt auf "FOUND" endet.
-                    line=${line%$'\r'}
-                    categorize_line "$line" "$chunk"
-                done < <(sed -n "$((prev + 1)),${new_total}p" "$out_file")
-                SEEN_LINES[$chunk]=$new_total
-                LAST_GROWTH[$chunk]=$SECONDS   # Zeitpunkt des letzten Fortschritts
-            done < <(find "$CHUNK_DIR" -maxdepth 1 -type f -name 'part_*' ! -name '*.*' -print0)
+                if [ "$new_total" -gt "$prev" ]; then
+                    while IFS= read -r line; do
+                        # 'script' liefert CRLF — ohne das Abschneiden hier
+                        # matcht z.B. das Muster '*" FOUND"' nicht mehr, weil
+                        # die Zeile dann auf "FOUND\r" endet.
+                        handle_output_line "${line%$'\r'}" "$chunk"
+                    done < <(sed -n "$((prev + 1)),${new_total}p" "$out_file")
+                    SEEN_LINES[$chunk]=$new_total
+                    LAST_GROWTH[$chunk]=$SECONDS   # Zeitpunkt des letzten Fortschritts
+                fi
+                [ "$finished" = true ] && DONE_CHUNKS[$chunk]=1
+            done
         }
 
         # Beendet Pakete, die seit STALL_TIMEOUT Sekunden keine einzige neue
@@ -738,7 +882,8 @@ run_scan() {
         # insgesamt braucht.
         check_stalled_chunks() {
             local chunk pid age
-            while IFS= read -r -d '' chunk; do
+            for chunk in "${CHUNKS[@]}"; do
+                [ -n "${DONE_CHUNKS[$chunk]:-}" ] && continue
                 [ -f "$chunk.pid" ] || continue       # läuft nicht (mehr)
                 [ -f "$chunk.rc"  ] && continue       # schon abgeschlossen
                 [ -f "$chunk.stalled" ] && continue   # bereits abgebrochen
@@ -755,12 +900,12 @@ run_scan() {
                 # 'timeout' selbst — sonst überlebt der eigentliche Scanner.
                 check_command pkill && pkill -TERM -P "$pid" 2>/dev/null
                 kill -TERM "$pid" 2>/dev/null
-            done < <(find "$CHUNK_DIR" -maxdepth 1 -type f -name 'part_*' ! -name '*.*' -print0)
+            done
         }
 
         monitor_parallel() {
             local run_pid=$1
-            declare -A SEEN_LINES IN_SUMMARY LAST_GROWTH
+            declare -A SEEN_LINES LAST_GROWTH DONE_CHUNKS
             while :; do
                 poll_chunk_outputs
                 check_stalled_chunks
@@ -793,7 +938,7 @@ run_scan() {
             local c wrc
             printf -v c '%q ' "$scanner" "${flags[@]}" "--file-list=$FILE_LIST"
             if check_command script; then
-                script -qfec "$c" /dev/null < /dev/null
+                SHELL="$BASH" script -qfec "$c" /dev/null < /dev/null
             else
                 stdbuf -oL "$scanner" "${flags[@]}" "--file-list=$FILE_LIST" < /dev/null
             fi
@@ -801,60 +946,43 @@ run_scan() {
             return "$wrc"
         }
 
-        local rc_file line started=false rc_read stalls=0
-        rc_file=$(mktemp)
-        local in_summary=false
+        local line rc_read partial="" quiet_since=$SECONDS stalls=0
+        RC_FILE=$(mktemp)
 
-        # read -t 120: liefert Exit-Code > 128 bei Zeitüberschreitung, 1 bei
-        # EOF. So fällt auf, wenn clamscan sich an einer Datei festbeißt,
-        # statt dass der Balken kommentarlos stehenbleibt.
+        # read -t 1: liefert Exit-Code > 128 bei Zeitüberschreitung, 1 bei
+        # EOF. Der kurze Timeout lässt die Laufzeit weiterzählen, während
+        # clamscan seine Datenbank lädt oder an einer großen Datei arbeitet,
+        # und nach 2 Minuten ganz ohne Ausgabe fällt auf, dass clamscan sich
+        # an einer Datei festbeißt, statt dass der Balken kommentarlos
+        # stehenbleibt.
         while :; do
-            IFS= read -r -t 120 line; rc_read=$?
+            IFS= read -r -t 1 line; rc_read=$?
             if [ "$rc_read" -gt 128 ]; then
-                stalls=$(( stalls + 1 ))
-                printf '\r%s%sSeit 2 Minuten keine Ausgabe (%d.) — letzte Datei: %s%s\n' \
-                    "$CLREOL" "$YELLOW" "$stalls" "${last_file:-?}" "$RESET"
+                # Bei Zeitüberschreitung legt read eine halb empfangene Zeile
+                # in $line ab — aufheben, bis der Rest kommt.
+                partial+=$line
+                if (( SECONDS - quiet_since >= 120 )); then
+                    quiet_since=$SECONDS
+                    stalls=$(( stalls + 1 ))
+                    printf '\r%s%sSeit 2 Minuten keine Ausgabe (%d.) — letzte Datei: %s%s\n' \
+                        "$CLREOL" "$YELLOW" "$stalls" "${last_file:-?}" "$RESET"
+                fi
+                draw_progress_bar "$scanned" "$total" "$infected"
                 continue
             fi
             [ "$rc_read" -ne 0 ] && break
 
-            line=${line%$'\r'}
+            line=$partial$line; partial=""
+            quiet_since=$SECONDS
+            handle_output_line "${line%$'\r'}" serial
 
-            case "$line" in
-                *"SCAN SUMMARY"*) in_summary=true;  continue ;;
-                "Time:"*)         in_summary=false; continue ;;
-                /*:\ *)           in_summary=false ;;
-            esac
-            [ "$in_summary" = true ] && continue
-
-            case "$line" in
-                *" FOUND")
-                    scanned=$(( scanned + 1 )); infected=$(( infected + 1 ))
-                    printf '\r%s%s%s%s\n' "$CLREOL" "$RED" "$line" "$RESET"
-                    printf '%s\n' "$line" >> "$RESULTS_FILE"
-                    ;;
-                *ERROR*|*"Access denied"*|*"Can't open"*|*"Can't access"*)
-                    scanned=$(( scanned + 1 )); errors=$(( errors + 1 ))
-                    printf '%s\n' "$line" >> "$RESULTS_FILE"
-                    ;;
-                LibClamAV*|WARNING*|Loading*|"Session terminated"*|"")
-                    :
-                    ;;
-                /*:\ *)
-                    last_file=${line%%:*}
-                    scanned=$(( scanned + 1 ))
-                    ;;
-            esac
-
-            if [ "$started" = false ] && [ "$scanned" -gt 0 ]; then
-                started=true
-                draw_progress_bar "$scanned" "$total" "$infected"
-            elif (( scanned > 0 && scanned % 20 == 0 )); then
+            # alle 20 Dateien neu zeichnen, mindestens aber einmal pro Sekunde
+            if (( scanned % 20 == 0 || SECONDS != LAST_DRAW )); then
                 draw_progress_bar "$scanned" "$total" "$infected"
             fi
-        done < <( { run_scanner; echo $? > "$rc_file"; } 2>&1 )
+        done < <( { run_scanner; echo $? > "$RC_FILE"; } 2>&1 )
 
-        rc=$(cat "$rc_file" 2>/dev/null); rm -f "$rc_file"
+        rc=$(cat "$RC_FILE" 2>/dev/null)
         [[ "$rc" =~ ^[0-9]+$ ]] || rc=2
     fi
 
@@ -863,16 +991,26 @@ run_scan() {
     echo; echo
 
     # --- Zusammenfassung -----------------------------------------------------
+    local duration result
+    fmt_duration duration $(( SECONDS - SCAN_START ))
+    # Funde haben Vorrang vor dem Exit-Code: Eine einzige nicht lesbare Datei
+    # in irgendeinem Paket hebt den Gesamt-Exit-Code auf 2 und würde die
+    # Funde sonst hinter "mit Fehlern beendet" verstecken.
+    if [ "$infected" -gt 0 ] || [ "$rc" -eq 1 ]; then
+        result="${RED}Schadsoftware gefunden${RESET}"
+        [ "$rc" -ge 2 ] && result+=" ${YELLOW}(zusätzlich Fehler, Exit-Code $rc)${RESET}"
+    elif [ "$rc" -eq 0 ]; then
+        result="${GREEN}sauber${RESET}"
+    else
+        result="${YELLOW}mit Fehlern beendet (Exit-Code $rc)${RESET}"
+    fi
+
     echo "-------------------------------------------"
     echo "Geprüfte Dateien: $scanned von $total"
     echo "Funde:             $infected"
     echo "Lesefehler:        $errors"
-    echo "Dauer:             $(fmt_duration $(( SECONDS - SCAN_START )))"
-    case "$rc" in
-        0) echo "Ergebnis: ${GREEN}sauber${RESET}" ;;
-        1) echo "Ergebnis: ${RED}Schadsoftware gefunden${RESET}" ;;
-        *) echo "Ergebnis: ${YELLOW}mit Fehlern beendet (Exit-Code $rc)${RESET}" ;;
-    esac
+    echo "Dauer:             $duration"
+    echo "Ergebnis: $result"
     echo "Protokoll: $RESULTS_FILE"
     [ -n "$QUARANTINE_DIR" ] && echo "Quarantäne: $QUARANTINE_DIR"
 
@@ -881,17 +1019,31 @@ run_scan() {
         echo "Geprüft: $scanned von $total"
         echo "Funde:    $infected"
         echo "Fehler:   $errors"
-        echo "Dauer:    $(fmt_duration $(( SECONDS - SCAN_START )))"
+        echo "Dauer:    $duration"
         echo "Exit-Code: $rc"
         echo "Beendet: $(date)"
     } >> "$RESULTS_FILE"
 
-    if [ "$errors" -gt 0 ] && [ "$EUID" -ne 0 ]; then
+    # Ohne root lässt find Nicht-Lesbares schon beim Erfassen weg — die
+    # Lesefehler allein würden also untertreiben, wie unvollständig der
+    # Scan ist.
+    if [ "$EUID" -ne 0 ] && [ $(( errors + SKIPPED_FILES + SKIPPED_DIRS )) -gt 0 ]; then
         echo
-        echo "${YELLOW}Hinweis:${RESET} $errors Dateien konnten nicht gelesen werden."
+        echo "${YELLOW}Hinweis:${RESET} Nicht alles war lesbar ($errors Lesefehler;"
+        echo "übersprungen: $SKIPPED_FILES Dateien, $SKIPPED_DIRS Verzeichnisse)."
         echo "Für einen vollständigen Systemscan das Skript mit sudo starten."
     fi
     return 0
+}
+
+# Führt einen Scan aus und räumt danach immer auf — egal, auf welchem Weg
+# perform_scan zurückkehrt.
+run_scan() {
+    local rc
+    perform_scan
+    rc=$?
+    finish_scan
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------

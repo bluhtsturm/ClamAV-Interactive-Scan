@@ -50,7 +50,7 @@ Dieses Skript legt eine Bedienoberfläche darüber:
 
 ```
 ====================================
-   ClamAV — interaktiver Scan v1.1.0
+   ClamAV — interaktiver Scan v1.2.0
 ====================================
 1) Internes System scannen (/)
 2) Externes Laufwerk scannen
@@ -74,7 +74,7 @@ Scan läuft — Abbruch mit Strg+C.
 | ------------------ | ------------------------------------------------------------- |
 | **Bash ≥ 4.4**     | wegen assoziativer Arrays, `wait -n` und `mapfile -d`          |
 | **ClamAV**         | `clamscan` und/oder `clamdscan` (+ `clamav-daemon` empfohlen)  |
-| **coreutils**      | `split`, `timeout`, `stdbuf`, `nproc`, `wc`, `sed`             |
+| **coreutils**      | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stty`, `wc` |
 | **findutils**      | GNU `find` (`-readable`, `-xdev`, `-print0`)                   |
 | **procps**         | `pkill` — ohne das Paket funktioniert der Abbruch weniger sauber |
 | **util-linux**     | `script` (optional, erzwingt zeilenweise Ausgabe von ClamAV)   |
@@ -129,7 +129,8 @@ Das Skript führt durch folgende Fragen:
 5. **Parallele Verbindungen** (nur `clamdscan`): Vorgabe ist `nproc`.
 6. **Auch eingehängte Dateisysteme?** Ohne diese Option bleibt der Scan per
    `-xdev` auf dem Dateisystem des Startpfads — ein separat eingehängtes `/home`
-   wird dann **nicht** mitgescannt.
+   wird dann **nicht** mitgescannt. Das gilt auch für Btrfs-Subvolumes (Standard
+   bei Fedora und openSUSE), siehe [Fehlerbehebung](#fehlerbehebung).
 
 Abbruch jederzeit mit **Strg+C**: Worker werden beendet, Temporärdateien gelöscht,
 das bisherige Protokoll bleibt erhalten.
@@ -198,23 +199,29 @@ EXCLUDE_PATHS=(
   Scanner, Flags und Dateizahl, danach alle Funde und Lesefehler sowie eine
   Zusammenfassung. Wird nach dem Lauf dem aufrufenden Benutzer übereignet, auch
   wenn das Skript unter `sudo` lief.
-* **Quarantäne:** `~/clamav_quarantine`, Rechte `700`.
+* **Quarantäne:** `~/clamav_quarantine`, Rechte `700`. Der Ordner wird bei
+  späteren Scans automatisch übersprungen.
 * **Abgebrochene Pakete:** `~/clamav_abbruch_part_XXXX_HHMMSS.list` — die
   vollständige Dateiliste des Pakets, damit sich der Rest gezielt nachscannen
-  lässt:
+  lässt (`$HOME` statt `~`: nach `=` expandiert die Shell die Tilde nicht):
 
   ```bash
-  clamdscan --fdpass --file-list=~/clamav_abbruch_part_aaad_141233.list
+  clamdscan --fdpass --file-list="$HOME/clamav_abbruch_part_aaad_141233.list"
   ```
 
 ### Exit-Codes
+
+Der Exit-Code des Scanners steht in der Zusammenfassung und im Protokoll:
 
 | Code | Bedeutung                                             |
 | ---- | ----------------------------------------------------- |
 | `0`  | sauber                                                |
 | `1`  | Schadsoftware gefunden                                |
 | `2`  | mit Fehlern beendet (u. a. abgebrochene Pakete)       |
-| `130`| durch Strg+C abgebrochen                              |
+
+Gibt es Funde **und** Fehler, meldet die Zusammenfassung „Schadsoftware
+gefunden (zusätzlich Fehler …)“ — Funde gehen vor. Das Skript selbst endet
+mit `0`, nach Strg+C mit `130`.
 
 ### Fehlerbehebung
 
@@ -234,9 +241,10 @@ betroffene Pfade in `EXCLUDE_PATHS` aufnehmen, `STALL_TIMEOUT` erhöhen,
 `CHUNK_SIZE` verkleinern oder in `clamd.conf` die Limits (`MaxScanSize`,
 `MaxFileSize`, `MaxRecursion`, `MaxFiles`) anpassen.
 
-**Viele Lesefehler**
-Ohne `sudo` sind die meisten Systemdateien nicht lesbar. Das Skript weist am Ende
-darauf hin.
+**Viele Lesefehler / übersprungene Dateien**
+Ohne `sudo` sind die meisten Systemdateien nicht lesbar. Was schon beim Erfassen
+nicht lesbar ist, wird übersprungen und als „Nicht lesbar, übersprungen: …“
+gezählt; das Skript weist am Ende darauf hin.
 
 **Der Balken erreicht keine 100 %**
 Erwartetes Verhalten, wenn Pakete abgebrochen wurden: deren restliche Dateien
@@ -244,7 +252,10 @@ werden nie gezählt. Die Zusammenfassung zeigt „geprüft X von Y“.
 
 **Ein separates `/home` wird nicht gescannt**
 `-xdev` ist Standard. Beim Umfang die Frage nach eingehängten Dateisystemen mit
-`j` beantworten.
+`j` beantworten. Auf Btrfs (Standard bei Fedora und openSUSE) zählt jedes
+Subvolume als eigenes Dateisystem — dort fehlen ohne `j` z. B. `/home`, `/var`
+oder `/opt`. Unter openSUSE dann `/.snapshots` in `EXCLUDE_PATHS` aufnehmen,
+sonst wird jeder Snapper-Snapshot erneut gescannt.
 
 ### Sicherheitshinweise
 
@@ -302,7 +313,7 @@ This script puts a usable front-end on top:
 
 ```
 ====================================
-   ClamAV — interactive scan v1.1.0
+   ClamAV — interactive scan v1.2.0
 ====================================
 1) Scan the internal system (/)
 2) Scan an external drive
@@ -326,7 +337,7 @@ Scan running — press Ctrl+C to abort.
 | ---------------- | ------------------------------------------------------------- |
 | **Bash ≥ 4.4**   | for associative arrays, `wait -n` and `mapfile -d`             |
 | **ClamAV**       | `clamscan` and/or `clamdscan` (+ `clamav-daemon` recommended)  |
-| **coreutils**    | `split`, `timeout`, `stdbuf`, `nproc`, `wc`, `sed`             |
+| **coreutils**    | `split`, `timeout`, `stdbuf`, `nproc`, `realpath`, `stty`, `wc` |
 | **findutils**    | GNU `find` (`-readable`, `-xdev`, `-print0`)                   |
 | **procps**       | `pkill` — without it aborting is less clean                    |
 | **util-linux**   | `script` (optional, forces line-buffered ClamAV output)        |
@@ -380,7 +391,8 @@ The script walks you through these questions:
 5. **Parallel connections** (`clamdscan` only): defaults to `nproc`.
 6. **Also scan mounted filesystems?** Without this the scan stays on the
    filesystem of the starting path via `-xdev` — a separately mounted `/home`
-   is then **not** included.
+   is then **not** included. The same applies to Btrfs subvolumes (the default
+   on Fedora and openSUSE), see [Troubleshooting](#troubleshooting).
 
 Abort any time with **Ctrl+C**: workers are terminated, temporary files removed,
 and the log written so far is kept.
@@ -449,22 +461,29 @@ EXCLUDE_PATHS=(
   flags and file count, then every detection and read error plus a summary.
   Ownership is handed to the calling user after the run, even when the script
   ran under `sudo`.
-* **Quarantine:** `~/clamav_quarantine`, mode `700`.
+* **Quarantine:** `~/clamav_quarantine`, mode `700`. Later scans skip this
+  folder automatically.
 * **Aborted chunks:** `~/clamav_aborted_part_XXXX_HHMMSS.list` — the complete
-  file list of that chunk, so the remainder can be rescanned deliberately:
+  file list of that chunk, so the remainder can be rescanned deliberately
+  (`$HOME` rather than `~`: the shell does not expand a tilde after `=`):
 
   ```bash
-  clamdscan --fdpass --file-list=~/clamav_aborted_part_aaad_141233.list
+  clamdscan --fdpass --file-list="$HOME/clamav_aborted_part_aaad_141233.list"
   ```
 
 ### Exit codes
+
+The scanner's exit code is shown in the summary and written to the log:
 
 | Code  | Meaning                                        |
 | ----- | ---------------------------------------------- |
 | `0`   | clean                                          |
 | `1`   | malware found                                  |
 | `2`   | finished with errors (including aborted chunks)|
-| `130` | aborted with Ctrl+C                            |
+
+With detections **and** errors the summary says "malware found (plus errors
+…)" — detections take priority. The script itself exits with `0`, or with
+`130` after Ctrl+C.
 
 ### Troubleshooting
 
@@ -484,9 +503,10 @@ affected paths to `EXCLUDE_PATHS`, raise `STALL_TIMEOUT`, lower `CHUNK_SIZE`, or
 adjust the limits in `clamd.conf` (`MaxScanSize`, `MaxFileSize`, `MaxRecursion`,
 `MaxFiles`).
 
-**Lots of read errors**
-Without `sudo` most system files are unreadable. The script points this out at
-the end.
+**Lots of read errors / skipped files**
+Without `sudo` most system files are unreadable. Whatever is unreadable while
+the file list is built is skipped and counted as "Not readable, skipped: …";
+the script points this out at the end.
 
 **The bar never reaches 100%**
 Expected when chunks were aborted: their remaining files are never counted. The
@@ -494,7 +514,10 @@ summary shows "scanned X of Y".
 
 **A separate `/home` is not scanned**
 `-xdev` is the default. Answer the scope question about mounted filesystems with
-`y`.
+`y`. On Btrfs (the default on Fedora and openSUSE) every subvolume counts as a
+filesystem of its own — without `y`, e.g. `/home`, `/var` or `/opt` are left
+out there. On openSUSE, add `/.snapshots` to `EXCLUDE_PATHS` in that case, or
+every Snapper snapshot gets scanned again.
 
 ### Safety notes
 
